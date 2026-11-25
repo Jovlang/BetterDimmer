@@ -206,26 +206,118 @@ void action(HWND window, int id) {
     }
     trayIcon(window, false);
 }
+constexpr COLORREF MenuBackground = RGB(31, 31, 31);
+
+struct MenuRow {
+    const wchar_t* label;
+    HFONT font;
+    int padding;
+};
+
+void measureRow(HWND window, MEASUREITEMSTRUCT& item, const MenuRow& row) {
+    const wchar_t* tab = std::wcschr(row.label, L'\t');
+    SIZE left{}, right{};
+    if (HDC dc = GetDC(window)) {
+        auto old = SelectObject(dc, row.font);
+        GetTextExtentPoint32W(dc, row.label, int(tab ? tab - row.label : std::wcslen(row.label)), &left);
+        if (tab) GetTextExtentPoint32W(dc, tab + 1, lstrlenW(tab + 1), &right);
+        SelectObject(dc, old);
+        ReleaseDC(window, dc);
+    }
+    item.itemWidth = left.cx + right.cx + row.padding * (tab ? 4 : 2);
+    item.itemHeight = *row.label ? std::max(left.cy, right.cy) + row.padding : row.padding / 2;
+}
+
+void drawRow(const DRAWITEMSTRUCT& item, const MenuRow& row) {
+    const bool disabled = (item.itemState & (ODS_DISABLED | ODS_GRAYED)) != 0;
+    const bool selected = !disabled && (item.itemState & ODS_SELECTED);
+    const int saved = SaveDC(item.hDC);
+    if (!saved) return;
+    auto brush = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
+    SetDCBrushColor(item.hDC, selected ? RGB(59, 59, 59) : MenuBackground);
+    FillRect(item.hDC, &item.rcItem, brush);
+    RECT text = item.rcItem;
+    text.left += row.padding;
+    text.right -= row.padding;
+    if (!*row.label) {
+        text.top += (text.bottom - text.top) / 2;
+        text.bottom = text.top + 1;
+        SetDCBrushColor(item.hDC, RGB(77, 77, 77));
+        FillRect(item.hDC, &text, brush);
+    } else {
+        const wchar_t* tab = std::wcschr(row.label, L'\t');
+        constexpr UINT style = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
+        SelectObject(item.hDC, row.font);
+        SetBkMode(item.hDC, TRANSPARENT);
+        SetTextColor(item.hDC, disabled ? RGB(163, 163, 163) : RGB(245, 245, 245));
+        DrawTextW(item.hDC, row.label, tab ? int(tab - row.label) : -1, &text, style);
+        if (tab) {
+            SetTextColor(item.hDC, RGB(181, 181, 181));
+            DrawTextW(item.hDC, tab + 1, -1, &text, style | DT_RIGHT);
+        }
+    }
+    RestoreDC(item.hDC, saved);
+}
+
 void menu(HWND window) {
     HMENU popup = CreatePopupMenu();
     POINT cursor{};
     if (!popup) return;
     if (!GetCursorPos(&cursor)) { DestroyMenu(popup); return; }
-    for (UINT i = 0; i < ARRAYSIZE(Keys); ++i)
-        AppendMenuW(popup, MF_STRING, First + i, Labels[i]);
-    if (displayError)
-        AppendMenuW(popup, MF_STRING | MF_GRAYED, 0, L"Gamma ramp not verified");
-    if (settingsError)
-        AppendMenuW(popup, MF_STRING | MF_GRAYED, 0, L"Settings not saved");
-    if (!conflicts.empty())
-        AppendMenuW(popup, MF_STRING | MF_GRAYED, 0, conflicts.c_str());
-    AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(popup, MF_STRING, Exit, L"Exit and restore display");
+
+    HIGHCONTRASTW contrast{};
+    contrast.cbSize = sizeof contrast;
+    const bool highContrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof contrast, &contrast, 0)
+                              && (contrast.dwFlags & HCF_HIGHCONTRASTON);
+    HBRUSH background = highContrast ? nullptr : CreateSolidBrush(MenuBackground);
+    MENUINFO info{};
+    info.cbSize = sizeof info;
+    info.fMask = MIM_BACKGROUND | MIM_STYLE;
+    info.hbrBack = background;
+    info.dwStyle = MNS_NOCHECK;
+    const bool dark = background && SetMenuInfo(popup, &info);
+    NONCLIENTMETRICSW metrics{};
+    metrics.cbSize = sizeof metrics;
+    HFONT custom = nullptr;
+    if (dark && SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof metrics, &metrics, 0))
+        custom = CreateFontIndirectW(&metrics.lfMenuFont);
+    HFONT font = custom ? custom : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    const int padding = std::max(8, int(GetSystemMetrics(SM_CYMENU)) / 2);
+
+    std::array<MenuRow, ARRAYSIZE(Keys) + 5> rows{};
+    size_t count = 0;
+    auto append = [&](UINT id, const wchar_t* label) {
+        if (dark) {
+            auto& row = rows[count++];
+            row = {label, font, padding};
+            MENUITEMINFOW item{};
+            item.cbSize = sizeof item;
+            item.fMask = MIIM_FTYPE | MIIM_ID | MIIM_STATE | MIIM_DATA | MIIM_STRING;
+            item.fType = MFT_OWNERDRAW;
+            item.fState = id ? MFS_ENABLED : MFS_DISABLED;
+            item.wID = id;
+            item.dwItemData = reinterpret_cast<ULONG_PTR>(&row);
+            item.dwTypeData = const_cast<wchar_t*>(label);
+            if (InsertMenuItemW(popup, UINT(GetMenuItemCount(popup)), TRUE, &item)) return;
+        }
+        const UINT flags = !*label ? MF_SEPARATOR : id ? MF_STRING : MF_STRING | MF_GRAYED;
+        AppendMenuW(popup, flags, id, label);
+    };
+
+    const std::wstring conflictsLabel = conflicts;
+    for (UINT i = 0; i < ARRAYSIZE(Keys); ++i) append(First + i, Labels[i]);
+    if (displayError) append(0, L"Gamma ramp not verified");
+    if (settingsError) append(0, L"Settings not saved");
+    if (!conflictsLabel.empty()) append(0, conflictsLabel.c_str());
+    append(0, L"");
+    append(Exit, L"Exit and restore display");
     SetForegroundWindow(window);
-    UINT id = TrackPopupMenu(popup, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+    UINT id = TrackPopupMenu(popup, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                              cursor.x, cursor.y, 0, window, nullptr);
     PostMessageW(window, WM_NULL, 0, 0);
     DestroyMenu(popup);
+    if (custom) DeleteObject(custom);
+    if (background) DeleteObject(background);
     if (id == Exit) SendMessageW(window, WM_CLOSE, 0, 0);
     else if (id) action(window, int(id));
 }
@@ -235,6 +327,20 @@ LRESULT CALLBACK procedure(HWND window, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     }
     switch (msg) {
+    case WM_MEASUREITEM: {
+        if (!l) break;
+        auto& item = *reinterpret_cast<MEASUREITEMSTRUCT*>(l);
+        if (item.CtlType != ODT_MENU || !item.itemData) break;
+        measureRow(window, item, *reinterpret_cast<const MenuRow*>(item.itemData));
+        return TRUE;
+    }
+    case WM_DRAWITEM: {
+        if (!l) break;
+        const auto& item = *reinterpret_cast<const DRAWITEMSTRUCT*>(l);
+        if (item.CtlType != ODT_MENU || !item.itemData) break;
+        drawRow(item, *reinterpret_cast<const MenuRow*>(item.itemData));
+        return TRUE;
+    }
     case Tray:
         if (l == WM_RBUTTONUP || l == WM_LBUTTONUP || l == WM_CONTEXTMENU) menu(window);
         return 0;

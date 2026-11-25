@@ -10,7 +10,7 @@ Native Win32 tray app for software dimming of the **primary display**. It change
 | Ctrl+Alt+Win+Right | Increase gamma (lighter midtones) |
 | Ctrl+Alt+Win+Home | Reset both controls |
 
-Click the tray icon for the same actions and **Exit and restore display**. Unavailable shortcuts are listed in the menu; the corresponding menu actions still work.
+Open the dark tray menu for the same actions and **Exit and restore display**. Unavailable shortcuts are listed in the menu; the corresponding menu actions still work. Windows high-contrast mode keeps the native system menu colors.
 
 Successful changes are saved under HKCU\Software\BetterDimmer and reapplied on the next launch. Reset saves neutral settings; exiting restores the original ramp without discarding saved settings. Forced termination cannot guarantee restoration. Brightness spans 50–100% of the original signal and gamma spans 0.70–1.50. Drivers may accept only part of these ranges.
 
