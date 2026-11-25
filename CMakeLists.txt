@@ -1,0 +1,21 @@
+cmake_minimum_required(VERSION 3.20)
+project(BetterDimmer LANGUAGES CXX RC)
+
+add_executable(BetterDimmer WIN32 main.cpp BetterDimmer.rc)
+target_compile_features(BetterDimmer PRIVATE cxx_std_17)
+target_compile_definitions(BetterDimmer PRIVATE UNICODE _UNICODE NOMINMAX)
+target_include_directories(BetterDimmer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(BetterDimmer PRIVATE user32 gdi32 shell32 advapi32)
+
+if(MSVC)
+    set_property(TARGET BetterDimmer PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+    target_compile_options(BetterDimmer PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
+elseif(MINGW)
+    target_compile_options(BetterDimmer PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>")
+    target_link_options(BetterDimmer PRIVATE -municode -static)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_test(NAME ramp_math COMMAND BetterDimmer --self-test)
+endif()

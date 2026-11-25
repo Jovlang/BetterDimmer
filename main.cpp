@@ -1,0 +1,353 @@
+#include <windows.h>
+#include <shellapi.h>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cwchar>
+#include <string>
+
+namespace {
+constexpr wchar_t App[] = L"BetterDimmer";
+constexpr wchar_t SettingsKey[] = L"Software\\BetterDimmer";
+constexpr UINT Tray = WM_APP + 1;
+constexpr UINT_PTR Refresh = 1;
+constexpr int First = 100, Exit = 200;
+constexpr UINT Keys[] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_HOME};
+constexpr const wchar_t* Labels[] = {
+    L"Increase brightness\tCtrl+Alt+Win+Up", L"Decrease brightness\tCtrl+Alt+Win+Down",
+    L"Decrease gamma\tCtrl+Alt+Win+Left", L"Increase gamma\tCtrl+Alt+Win+Right",
+    L"Reset\tCtrl+Alt+Win+Home"
+};
+
+struct Settings {
+    int brightness = 100, gamma = 100;
+    bool neutral() const { return brightness == 100 && gamma == 100; }
+};
+Settings load() {
+    DWORD value = 0, size = sizeof value;
+    if (RegGetValueW(HKEY_CURRENT_USER, SettingsKey, L"Levels", RRF_RT_REG_DWORD,
+                     nullptr, &value, &size) == ERROR_SUCCESS) {
+        Settings s{int(value & 0xffff), int(value >> 16)};
+        if (s.brightness >= 50 && s.brightness <= 100 && s.gamma >= 70 && s.gamma <= 150)
+            return s;
+    }
+    return {};
+}
+bool save(Settings s) {
+    DWORD value = DWORD(s.brightness) | (DWORD(s.gamma) << 16);
+    return RegSetKeyValueW(HKEY_CURRENT_USER, SettingsKey, L"Levels", REG_DWORD,
+                          &value, sizeof value) == ERROR_SUCCESS;
+}
+
+using Ramp = std::array<WORD, 3 * 256>;
+Ramp adjusted(const Ramp& base, Settings s) {
+    if (s.neutral()) return base;
+    Ramp out{};
+    for (int i = 0; i < 256; ++i) {
+        double input = 255 * std::pow(i / 255.0, 100.0 / s.gamma);
+        int lo = int(input), hi = std::min(lo + 1, 255);
+        for (int channel = 0; channel < 3; ++channel) {
+            int offset = channel * 256;
+            double sample = base[offset + lo] + (input - lo) *
+                            (int(base[offset + hi]) - base[offset + lo]);
+            out[offset + i] = WORD(std::lround(sample * s.brightness / 100.0));
+        }
+    }
+    return out;
+}
+bool matchesRamp(const Ramp& a, const Ramp& b) {
+    for (size_t i = 0; i < a.size(); ++i)
+        if (std::abs(int(a[i]) - b[i]) > 512) return false;
+    return true;
+}
+std::wstring primary() {
+    DISPLAY_DEVICEW dev{};
+    for (DWORD i = 0;; ++i) {
+        dev.cb = sizeof dev;
+        if (!EnumDisplayDevicesW(nullptr, i, &dev, 0)) return {};
+        if (dev.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) return dev.DeviceName;
+    }
+}
+
+bool attached(const std::wstring& name) {
+    DISPLAY_DEVICEW dev{};
+    for (DWORD i = 0;; ++i) {
+        dev.cb = sizeof dev;
+        if (!EnumDisplayDevicesW(nullptr, i, &dev, 0)) return false;
+        if (name == dev.DeviceName) return (dev.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
+    }
+}
+
+class Display {
+    HDC dc_ = nullptr;
+    std::wstring device_;
+    Ramp baseline_{}, last_{};
+    bool owned_ = false;
+
+public:
+    ~Display() { restore(); if (dc_) DeleteDC(dc_); }
+    Display() = default;
+    Display(const Display&) = delete;
+    Display& operator=(const Display&) = delete;
+
+    bool restore() {
+        if (!owned_) return true;
+        if (!attached(device_)) { owned_ = false; return true; }
+        Ramp current{}, result{};
+        if (!GetDeviceGammaRamp(dc_, current.data())) return false;
+        if (matchesRamp(current, last_) && !matchesRamp(current, baseline_) &&
+            (!SetDeviceGammaRamp(dc_, baseline_.data()) ||
+             !GetDeviceGammaRamp(dc_, result.data()) || !matchesRamp(result, baseline_)))
+            return false;
+        owned_ = false;
+        return true;
+    }
+
+    bool prepare(bool reopen = false) {
+        std::wstring name = primary();
+        if (name.empty()) return false;
+        if (name != device_ && !restore()) return false;
+        if (!dc_ || reopen || name != device_) {
+            HDC next = CreateDCW(L"DISPLAY", name.c_str(), nullptr, nullptr);
+            if (!next) return false;
+            if (dc_) DeleteDC(dc_);
+            dc_ = next;
+            device_ = name;
+        }
+        return true;
+    }
+
+    bool apply(Settings s, bool reopen = false, bool requireChange = false) {
+        if (!prepare(reopen)) return false;
+        Ramp before{}, after{};
+        if (!GetDeviceGammaRamp(dc_, before.data())) return false;
+        // If Windows or a calibration tool replaced our ramp, use that as the new baseline.
+        if (!owned_ || !matchesRamp(before, last_)) {
+            baseline_ = before;
+            owned_ = false;
+        }
+        if (s.neutral()) return restore();
+        Ramp target = adjusted(baseline_, s);
+        if (matchesRamp(before, target)) return !requireChange;
+        if (!SetDeviceGammaRamp(dc_, target.data())) return false;
+        bool read = GetDeviceGammaRamp(dc_, after.data()) != FALSE;
+        if (!read || !matchesRamp(after, target)) {
+            // The driver may return success without accepting the ramp.
+            if (!read || !matchesRamp(after, before)) {
+                SetDeviceGammaRamp(dc_, before.data());
+                Ramp rollback{};
+                if (!GetDeviceGammaRamp(dc_, rollback.data()) || !matchesRamp(rollback, before)) {
+                    last_ = read ? after : target;
+                    owned_ = true; // Leave cleanup a chance to restore the baseline.
+                }
+            }
+            return false;
+        }
+        last_ = after;
+        owned_ = true;
+        return true;
+    }
+};
+
+Display display;
+Settings levels;
+HICON icon;
+UINT taskbarCreated;
+bool added;
+bool displayError, settingsError;
+std::wstring conflicts;
+constexpr wchar_t RampError[] =
+    L"Windows could not verify the requested gamma ramp. Try SDR or a milder setting.";
+
+NOTIFYICONDATAW trayData(HWND window) {
+    NOTIFYICONDATAW data{};
+    data.cbSize = sizeof data;
+    data.hWnd = window;
+    data.uID = 1;
+    return data;
+}
+bool trayIcon(HWND window, bool add) {
+    auto data = trayData(window);
+    data.uFlags = NIF_TIP;
+    std::swprintf(data.szTip, ARRAYSIZE(data.szTip), L"BetterDimmer: light %d%%, gamma %.2f%ls",
+                  levels.brightness, levels.gamma / 100.0,
+                  displayError || settingsError ? L" (!)" : L"");
+    if (add) {
+        data.uFlags |= NIF_ICON | NIF_MESSAGE;
+        data.hIcon = icon;
+        data.uCallbackMessage = Tray;
+    }
+    return Shell_NotifyIconW(add ? NIM_ADD : NIM_MODIFY, &data) != FALSE;
+}
+void balloon(HWND window, const wchar_t* message) {
+    auto data = trayData(window);
+    data.uFlags = NIF_INFO;
+    lstrcpynW(data.szInfoTitle, App, ARRAYSIZE(data.szInfoTitle));
+    lstrcpynW(data.szInfo, message, ARRAYSIZE(data.szInfo));
+    data.dwInfoFlags = NIIF_WARNING;
+    Shell_NotifyIconW(NIM_MODIFY, &data);
+}
+void action(HWND window, int id) {
+    Settings next = levels;
+    switch (id - First) {
+    case 0: next.brightness = std::min(100, next.brightness + 5); break;
+    case 1: next.brightness = std::max(50, next.brightness - 5); break;
+    case 2: next.gamma = std::max(70, next.gamma - 5); break;
+    case 3: next.gamma = std::min(150, next.gamma + 5); break;
+    case 4: next = {}; break;
+    default: return;
+    }
+    displayError = !display.apply(next);
+    if (displayError) balloon(window, RampError);
+    else {
+        levels = next;
+        settingsError = !save(levels);
+        if (settingsError) balloon(window, L"Could not save settings for the next launch.");
+    }
+    trayIcon(window, false);
+}
+void menu(HWND window) {
+    HMENU popup = CreatePopupMenu();
+    POINT cursor{};
+    if (!popup) return;
+    if (!GetCursorPos(&cursor)) { DestroyMenu(popup); return; }
+    for (UINT i = 0; i < ARRAYSIZE(Keys); ++i)
+        AppendMenuW(popup, MF_STRING, First + i, Labels[i]);
+    if (displayError)
+        AppendMenuW(popup, MF_STRING | MF_GRAYED, 0, L"Gamma ramp not verified");
+    if (settingsError)
+        AppendMenuW(popup, MF_STRING | MF_GRAYED, 0, L"Settings not saved");
+    if (!conflicts.empty())
+        AppendMenuW(popup, MF_STRING | MF_GRAYED, 0, conflicts.c_str());
+    AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(popup, MF_STRING, Exit, L"Exit and restore display");
+    SetForegroundWindow(window);
+    UINT id = TrackPopupMenu(popup, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                             cursor.x, cursor.y, 0, window, nullptr);
+    PostMessageW(window, WM_NULL, 0, 0);
+    DestroyMenu(popup);
+    if (id == Exit) SendMessageW(window, WM_CLOSE, 0, 0);
+    else if (id) action(window, int(id));
+}
+LRESULT CALLBACK procedure(HWND window, UINT msg, WPARAM w, LPARAM l) {
+    if (taskbarCreated && msg == taskbarCreated) {
+        added = trayIcon(window, true);
+        return 0;
+    }
+    switch (msg) {
+    case Tray:
+        if (l == WM_RBUTTONUP || l == WM_LBUTTONUP || l == WM_CONTEXTMENU) menu(window);
+        return 0;
+    case WM_HOTKEY: action(window, int(w)); return 0;
+    case WM_DISPLAYCHANGE: SetTimer(window, Refresh, 500, nullptr); return 0;
+    case WM_POWERBROADCAST:
+        if (w == PBT_APMRESUMEAUTOMATIC || w == PBT_APMRESUMESUSPEND)
+            SetTimer(window, Refresh, 500, nullptr);
+        return TRUE;
+    case WM_TIMER:
+        if (w == Refresh) {
+            KillTimer(window, Refresh);
+            displayError = !display.apply(levels, true);
+            trayIcon(window, false);
+        }
+        return 0;
+    case WM_ENDSESSION:
+        if (w) display.restore();
+        return 0;
+    case WM_CLOSE:
+        if (!display.restore()) {
+            MessageBoxW(window, L"Could not restore the original gamma ramp. "
+                                L"BetterDimmer is still running so you can retry.",
+                        App, MB_OK | MB_ICONWARNING);
+            return 0;
+        }
+        DestroyWindow(window);
+        return 0;
+    case WM_DESTROY: {
+        for (UINT i = 0; i < ARRAYSIZE(Keys); ++i) UnregisterHotKey(window, First + i);
+        auto data = trayData(window);
+        if (added) Shell_NotifyIconW(NIM_DELETE, &data);
+        PostQuitMessage(0);
+        return 0;
+    }
+    }
+    return DefWindowProcW(window, msg, w, l);
+}
+
+bool selfTest() {
+    Ramp base{};
+    for (int c = 0; c < 3; ++c)
+        for (int i = 0; i < 256; ++i)
+            base[c * 256 + i] = WORD(i * (257 - c));
+    const auto dim = adjusted(base, {50, 100});
+    const auto dark = adjusted(base, {100, 70});
+    const auto light = adjusted(base, {100, 150});
+    if (adjusted(base, {}) != base || dim[255] != 32768 || dim[511] != 32640 ||
+        !(dark[128] < base[128] && light[128] > base[128]) ||
+        dark[255] != base[255] || light[255] != base[255] || matchesRamp(dim, base))
+        return false;
+    for (const auto* ramp : {&dim, &dark, &light})
+        for (int c = 0; c < 3; ++c)
+            if (!std::is_sorted(ramp->begin() + c * 256, ramp->begin() + (c + 1) * 256))
+                return false;
+    return true;
+}
+} // namespace
+
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR args, int) {
+    if (std::wcscmp(args, L"--self-test") == 0) return selfTest() ? 0 : 1;
+    bool probe = std::wcscmp(args, L"--probe") == 0;
+    bool check = std::wcscmp(args, L"--check") == 0;
+    if (*args && !probe && !check) return 64;
+    HANDLE singleton = CreateMutexW(nullptr, FALSE, L"Local\\BetterDimmer.Singleton");
+    if (!singleton) return 1;
+    const bool running = GetLastError() == ERROR_ALREADY_EXISTS;
+    if (running) { CloseHandle(singleton); return 2; }
+    if (check || probe) {
+        bool applied = display.apply(probe ? Settings{90, 100} : Settings{}, false, probe);
+        bool restored = display.restore();
+        if (restored) CloseHandle(singleton);
+        return !restored ? 4 : !applied ? 3 : 0;
+    }
+
+    icon = LoadIconW(instance, MAKEINTRESOURCEW(1));
+    if (!icon) icon = LoadIconW(nullptr, IDI_APPLICATION);
+    taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    WNDCLASSW cls{};
+    cls.hInstance = instance;
+    cls.lpszClassName = App;
+    cls.lpfnWndProc = procedure;
+    cls.hIcon = icon;
+    if (!RegisterClassW(&cls)) return 1;
+    HWND window = CreateWindowExW(WS_EX_TOOLWINDOW, App, App, WS_POPUP,
+                                  0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
+    if (!window) return 1;
+    levels = load();
+    added = trayIcon(window, true);
+    if (!added) {
+        MessageBoxW(nullptr, L"Could not create the tray icon.", App, MB_OK | MB_ICONERROR);
+        DestroyWindow(window);
+        return 1;
+    }
+    constexpr const wchar_t* shortNames[] = {L"Up", L"Down", L"Left", L"Right", L"Home"};
+    for (UINT i = 0; i < ARRAYSIZE(Keys); ++i) {
+        if (!RegisterHotKey(window, First + i, MOD_CONTROL | MOD_ALT | MOD_WIN, Keys[i])) {
+            if (conflicts.empty()) conflicts = L"Unavailable shortcuts: ";
+            else conflicts += L", ";
+            conflicts += shortNames[i];
+        }
+    }
+    displayError = !display.apply(levels);
+    trayIcon(window, false);
+    if (displayError) balloon(window, RampError);
+    else if (!conflicts.empty()) balloon(window, conflicts.c_str());
+    MSG msg{};
+    BOOL more;
+    while ((more = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    display.restore();
+    CloseHandle(singleton);
+    return more == -1 ? 1 : int(msg.wParam);
+}
